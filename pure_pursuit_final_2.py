@@ -173,7 +173,7 @@ class PurePursuitAvoid(Node):
         self.declare_parameter('queue_size', 10)
 
         # Speed settings
-        self.base_speed = 3.0           # default full speed
+        self.base_speed = 4.0           # default full speed
         self.slow_speed = 1.0          # speed when blocked & no side path
         self.side_path_speed = 3.0      # speed on side path
         self.side_shift = 0.7          # shift in meters for side path
