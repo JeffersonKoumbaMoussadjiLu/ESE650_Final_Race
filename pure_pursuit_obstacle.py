@@ -12,15 +12,12 @@ from visualization_msgs.msg import Marker
 from geometry_msgs.msg import Point
 from std_msgs.msg import ColorRGBA
 
-
 # ------------------------------------------------------------------------
 # Utility Classes/Functions
 # ------------------------------------------------------------------------
 
 class FixedQueue:
-    """
-    A simple fixed-length queue to compute a rolling average.
-    """
+    """A simple fixed-length queue to compute a rolling average."""
     def __init__(self, size):
         self.size = size
         self.data = []
@@ -31,416 +28,222 @@ class FixedQueue:
         self.data.append(value)
 
     def get_mean(self):
-        if len(self.data) == 0:
-            return 0.0
-        return sum(self.data) / len(self.data)
-
+        return sum(self.data)/len(self.data) if self.data else 0.0
 
 def compute_yaw_list(x_list, y_list):
-    """
-    Compute approximate yaw for each waypoint based on direction
-    from waypoint i->i+1.
-    """
+    """Compute approximate yaw for each waypoint based on direction between consecutive points."""
     n_points = len(x_list)
     yaw_list = np.zeros(n_points, dtype=float)
     for i in range(n_points - 1):
         dx = x_list[i+1] - x_list[i]
         dy = y_list[i+1] - y_list[i]
         yaw_list[i] = math.atan2(dy, dx)
-    # For the last waypoint, repeat the previous yaw
     if n_points > 1:
         yaw_list[-1] = yaw_list[-2]
     return yaw_list
 
-
 def compute_speed_list(x_list, y_list, base_speed):
-    """
-    Return a constant speed array of length len(x_list).
-    Uses a 'base_speed' parameter for easy tuning.
-    """
-    n_points = len(x_list)
-    return np.full(n_points, base_speed, dtype=float)
+    """Generate constant speed array matching waypoint count."""
+    return np.full(len(x_list), base_speed, dtype=float)
 
-
-def get_lookahead(
-    curr_pos,
-    curr_yaw,
-    xyv_list,
-    yaw_list,
-    v_list,
-    lookahead_dist,
-    lookahead_points,
-    lookbehind_points,
-    slope
-):
-    """
-    1) Find the index of the closest waypoint.
-    2) Adjust lookahead distance if path yaw differs significantly from current heading.
-    3) Return heading error, target speed, target point, target index.
-    """
+def get_lookahead(curr_pos, curr_yaw, xyv_list, yaw_list, v_list,
+                 lookahead_dist, lookahead_points, lookbehind_points, slope):
+    """Calculate target point and heading error using adaptive pure pursuit logic."""
     waypoints_xy = xyv_list[:, :2]
-
-    # 1) Closest waypoint by distance
-    dists = np.sqrt(np.sum((waypoints_xy - curr_pos) ** 2, axis=1))
+    dists = np.sqrt(np.sum((waypoints_xy - curr_pos)**2, axis=1))
     closest_idx = np.argmin(dists)
-
-    # 2) Decide target index
-    target_idx = closest_idx + lookahead_points
-    target_idx = max(0, target_idx - lookbehind_points)
-    if target_idx >= waypoints_xy.shape[0]:
-        target_idx = waypoints_xy.shape[0] - 1
-
-    # 3) Modulate lookahead dist if big yaw difference
+    
+    target_idx = max(0, closest_idx + lookahead_points - lookbehind_points)
+    target_idx = min(target_idx, len(waypoints_xy)-1)
+    
     path_yaw = yaw_list[target_idx]
-    yaw_diff = abs(path_yaw - curr_yaw)
-    yaw_diff = min(yaw_diff, math.pi)
-    L_mod = lookahead_dist * (1.0 - slope * (yaw_diff / math.pi))
-    L_mod = max(0.5, L_mod)
-
-    # 4) Advance while distance < L_mod
-    while True:
-        if target_idx >= waypoints_xy.shape[0] - 1:
-            break
-        if np.linalg.norm(waypoints_xy[target_idx] - curr_pos) >= L_mod:
-            break
+    yaw_diff = min(abs(path_yaw - curr_yaw), math.pi)
+    L_mod = max(0.5, lookahead_dist * (1.0 - slope*(yaw_diff/math.pi)))
+    
+    while target_idx < len(waypoints_xy)-1 and \
+          np.linalg.norm(waypoints_xy[target_idx] - curr_pos) < L_mod:
         target_idx += 1
-
-    target_idx = min(target_idx, waypoints_xy.shape[0] - 1)
+    
     target_point = waypoints_xy[target_idx]
-    target_speed = v_list[target_idx]
-
-    # 5) Heading error
-    dx = target_point[0] - curr_pos[0]
-    dy = target_point[1] - curr_pos[1]
+    dx, dy = target_point - curr_pos
     heading_to_point = math.atan2(dy, dx)
-    error = heading_to_point - curr_yaw
-    # Wrap [-pi, pi]
-    if error > math.pi:
-        error -= 2 * math.pi
-    elif error < -math.pi:
-        error += 2 * math.pi
-
-    return error, target_speed, target_point, target_idx
-
+    error = (heading_to_point - curr_yaw + math.pi) % (2*math.pi) - math.pi
+    return error, v_list[target_idx], target_point, target_idx
 
 # ------------------------------------------------------------------------
-# Main Node
+# Main Node with Robust Initialization
 # ------------------------------------------------------------------------
-
-WIDTH = 0.2032
-WHEEL_LENGTH = 0.0381
-MAX_STEER = 0.48
-
-csv_loc = './smoothed_final_waypoints.csv'
 
 class PurePursuit(Node):
-    """
-    Basic Pure Pursuit with obstacle avoidance and bounding box slowdown
-    """
-
     def __init__(self):
         super().__init__('pure_pursuit_node')
-
-        # Real or sim toggle
-        self.flag = False
-        self.get_logger().info(f"Real-world test? {self.flag}")
-
-        #
-        # Declare ROS parameters, including speed parameters
-        #
-        self.declare_parameter('lookahead_distance', 1.2)
-        self.declare_parameter('lookahead_points', 8)
-        self.declare_parameter('lookbehind_points', 2)
-        self.declare_parameter('L_slope_atten', 0.7)
-
-        self.declare_parameter('kp', 0.6)
-        self.declare_parameter('ki', 0.0)
-        self.declare_parameter('kd', 0.005)
-        self.declare_parameter('steer_alpha', 1.0)
-        self.declare_parameter('max_control', MAX_STEER)
-
-        # Speed parameters
-        self.declare_parameter('base_speed', 4.5)
-        self.declare_parameter('blocked_speed', 1.5)
-        self.declare_parameter('box_speed', 2.0)
-
-        # PID states
+        
+        # Initialize all required attributes first
+        self.target_point = np.array([0.0, 0.0])  # Critical initialization
+        self.curr_target_idx = 0
         self.prev_error = 0.0
         self.integral = 0.0
         self.prev_steer = 0.0
+        self.min_front_distance = float('inf')
+        self.speed = 0.0
 
-        # Load CSV
-        waypoints = np.loadtxt(csv_loc, delimiter=',', skiprows=0)
-        self.x_list = waypoints[:, 0]
-        self.y_list = waypoints[:, 1]
+        # Declare parameters
+        self.declare_parameters(namespace='',
+            parameters=[
+                ('lookahead_distance', 1.2),
+                ('lookahead_points', 8),
+                ('lookbehind_points', 2),
+                ('L_slope_atten', 0.7),
+                ('kp', 0.6), ('ki', 0.0), ('kd', 0.005),
+                ('steer_alpha', 1.0), ('max_control', 0.48),
+                ('base_speed', 4.5), ('box_speed', 2.0),
+                ('real_world', False)
+            ])
 
-        # Retrieve 'base_speed' param to build speed list
-        base_speed = self.get_parameter('base_speed').get_parameter_value().double_value
+        # Load waypoints
+        waypoints = np.loadtxt('./mpc_levine_1000.csv', delimiter=',')
+        self.x_list, self.y_list = waypoints[:, 0], waypoints[:, 1]
+        base_speed = self.get_parameter('base_speed').value
         self.v_list = compute_speed_list(self.x_list, self.y_list, base_speed)
-
         self.yaw_list = compute_yaw_list(self.x_list, self.y_list)
         self.xyv_list = np.column_stack((self.x_list, self.y_list, self.v_list))
 
-        self.v_max = np.max(self.v_list)
-        self.v_min = np.min(self.v_list)
+        # Initialize ROS components
+        self.initialize_ros_components()
 
-        self.get_logger().info(f"Loaded {len(self.x_list)} CSV waypoints with base_speed={base_speed:.2f} m/s.")
+        # Bounding box configuration
+        self.box_x_min, self.box_x_max = -21.0432, -15.8303
+        self.box_y_min, self.box_y_max = -4.71817, 8.26059
 
-        #
-        # Subscriptions
-        #
-        if self.flag:
-            # Real
-            odom_topic_pose = '/pf/viz/inferred_pose'
-            odom_topic_speed = '/odom'
-            self.odom_sub_ = self.create_subscription(PoseStamped, odom_topic_pose, self.pose_callback, 10)
-            self.odom_sub_speed = self.create_subscription(Odometry, odom_topic_speed, self.speed_callback, 10)
+        self.get_logger().info("Pure Pursuit node initialized")
+
+    def initialize_ros_components(self):
+        """Set up ROS subscribers and publishers."""
+        if self.get_parameter('real_world').value:
+            self.odom_sub_ = self.create_subscription(
+                PoseStamped, '/pf/viz/inferred_pose', self.pose_callback, 10)
         else:
-            # Sim
-            odom_topic_pose = '/ego_racecar/odom'
-            self.odom_sub_ = self.create_subscription(Odometry, odom_topic_pose, self.pose_callback, 10)
-            self.odom_sub_speed = None  # optional
-        self.scan_sub_ = self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
-
-        #
-        # Publishers
-        #
-        drive_topic = '/drive'
-        waypoint_topic = '/waypoint'
-        waypoint_path_topic = '/waypoint_path'
-        self.drive_pub_ = self.create_publisher(AckermannDriveStamped, drive_topic, 10)
-        self.waypoint_pub_ = self.create_publisher(Marker, waypoint_topic, 10)
-        self.waypoint_path_pub_ = self.create_publisher(Marker, waypoint_path_topic, 10)
-
-        #
-        # Obstacle avoidance variables
-        #
-        self.min_front_distance = float('inf')
-        self.last_time = self.get_clock().now().nanoseconds / 1e9
-        self.speed = 0.0
-
-        #
-        # Visualization placeholders
-        #
-        self.target_point = np.array([0.0, 0.0])
-        self.curr_target_idx = 0
-
-        #
-        # Bounding box corners => if inside, cap speed to 'box_speed'
-        #
-        self.box_x_min = -21.0432
-        self.box_x_max = -15.8303
-        self.box_y_min = -4.71817
-        self.box_y_max =  8.26059
-
-        self.get_logger().info("Pure Pursuit node started with obstacle avoidance.")
-
-    # --------------------------------------------------------------------------
-    # LIDAR callback
-    # --------------------------------------------------------------------------
-    def scan_callback(self, scan_msg: LaserScan):
-        n_ranges = len(scan_msg.ranges)
+            self.odom_sub_ = self.create_subscription(
+                Odometry, '/ego_racecar/odom', self.pose_callback, 10)
         
-        # Focus on center 100 readings (50 each side of center)
-        center_idx = n_ranges // 2
-        num_readings = 150
+        self.scan_sub_ = self.create_subscription(
+            LaserScan, '/scan', self.scan_callback, 10)
+        
+        self.drive_pub_ = self.create_publisher(
+            AckermannDriveStamped, '/drive', 10)
+        self.waypoint_pub_ = self.create_publisher(Marker, '/waypoint', 10)
+        self.waypoint_path_pub_ = self.create_publisher(
+            Marker, '/waypoint_path', 10)
+
+    def scan_callback(self, scan_msg: LaserScan):
+        """Process LIDAR data with obstacle detection."""
+        num_readings = 150  # ~±30 degree FOV
+        center_idx = len(scan_msg.ranges) // 2
         lower_idx = center_idx - (num_readings // 2)
         upper_idx = center_idx + (num_readings // 2)
-        cared = np.array(scan_msg.ranges[lower_idx:upper_idx])
         
-        # Filter invalid readings and get minimum distance
-        valid_mask = (cared >= scan_msg.range_min) & (cared <= scan_msg.range_max)
-        cared[~valid_mask] = float('inf')  # Ignore invalid readings
-        self.min_front_distance = np.min(cared)
+        ranges = np.array(scan_msg.ranges[lower_idx:upper_idx])
+        valid_mask = (ranges >= scan_msg.range_min) & (ranges <= scan_msg.range_max)
+        valid_ranges = ranges[valid_mask]
         
-        # Update timing for potential future use
-        now_time = self.get_clock().now().nanoseconds / 1e9
-        self.last_time = now_time
+        self.min_front_distance = np.min(valid_ranges) if valid_ranges.size > 0 else float('inf')
 
-    # --------------------------------------------------------------------------
-    # Speed callback
-    # --------------------------------------------------------------------------
-    def speed_callback(self, odom_msg: Odometry):
-        self.speed = odom_msg.twist.twist.linear.x
-
-    # --------------------------------------------------------------------------
-    # Pose callback
-    # --------------------------------------------------------------------------
     def pose_callback(self, msg):
-        if self.flag:
-            # Real => PoseStamped
-            curr_x = msg.pose.position.x
-            curr_y = msg.pose.position.y
+        """Main control loop with safety checks."""
+        # Pose processing
+        if self.get_parameter('real_world').value:
+            pos = msg.pose.position
             curr_quat = msg.pose.orientation
         else:
-            # Sim => Odometry
-            curr_x = msg.pose.pose.position.x
-            curr_y = msg.pose.pose.position.y
+            pos = msg.pose.pose.position
             curr_quat = msg.pose.pose.orientation
-            # Also read speed from same message
             self.speed = msg.twist.twist.linear.x
 
-        # Convert quaternion to yaw
+        curr_pos = np.array([pos.x, pos.y])
         curr_yaw = math.atan2(
             2*(curr_quat.w * curr_quat.z + curr_quat.x * curr_quat.y),
             1 - 2*(curr_quat.y**2 + curr_quat.z**2)
         )
-        curr_pos = np.array([curr_x, curr_y])
 
-        # Retrieve relevant parameters
-        L = self.get_parameter('lookahead_distance').get_parameter_value().double_value
-        lookahead_points = self.get_parameter('lookahead_points').get_parameter_value().integer_value
-        lookbehind_points = self.get_parameter('lookbehind_points').get_parameter_value().integer_value
-        slope = self.get_parameter('L_slope_atten').get_parameter_value().double_value
-
-        # Additional speed params
-        blocked_speed = self.get_parameter('blocked_speed').get_parameter_value().double_value
-        box_speed = self.get_parameter('box_speed').get_parameter_value().double_value
-
-        # 1) get lookahead
-        error, target_v, target_point, idx = get_lookahead(
-            curr_pos, curr_yaw,
-            self.xyv_list, self.yaw_list, self.v_list,
-            L, lookahead_points, lookbehind_points, slope
+        # Calculate target point
+        params = self.get_parameters([
+            'lookahead_distance', 'lookahead_points',
+            'lookbehind_points', 'L_slope_atten'
+        ])
+        error, target_v, target_point, _ = get_lookahead(
+            curr_pos, curr_yaw, self.xyv_list, self.yaw_list, self.v_list,
+            params[0].value, params[1].value, params[2].value, params[3].value
         )
-        self.target_point = target_point
-        self.curr_target_idx = idx
+        self.target_point = target_point  # Ensure this is always set
 
-        # 2) slow down if obstacle 2 m in front
-        slow_threshold = 2.0
-        if self.min_front_distance < slow_threshold:
-            target_v = 2.0
-            self.get_logger().warn(f"Obstacle detected! Distance: {self.min_front_distance:.2f}m")
-
-        slow_threshold2 = 1.0
-        if self.min_front_distance < slow_threshold:
-            target_v = 1.0
-            self.get_logger().warn(f"Obstacle detected! Distance: {self.min_front_distance:.2f}m")
-
-        #3) stop if obstacle 1 m in front
-        stop_threshold = 0.5
-        if self.min_front_distance < stop_threshold:
+        # Obstacle response
+        if self.min_front_distance < 0.5:
             target_v = 0.0
-            self.get_logger().warn(f"Obstacle detected! Distance: {self.min_front_distance:.2f}m")
+        elif self.min_front_distance < 1.0:
+            target_v = min(target_v, 1.0)
+        elif self.min_front_distance < 2.0:
+            target_v = min(target_v, 2.0)
+
+        # Bounding box speed limit
+        if self.is_in_bounding_box(curr_pos[0], curr_pos[1]):
+            target_v = min(target_v, self.get_parameter('box_speed').value)
+
+        # Calculate steering
+        steer = self.calculate_steering(error)
         
-
-        # 3) If inside bounding box => clamp speed to box_speed
-        if self.is_in_bounding_box(curr_x, curr_y):
-            target_v = min(target_v, box_speed)
-
-        # Steering
-        steer = self.get_steer(error)
-
-        # Publish
-        ack_msg = AckermannDriveStamped()
-        ack_msg.drive.speed = float(target_v)
-        ack_msg.drive.steering_angle = float(steer)
-        print(f"Speed: {float(target_v)}, Steering Angle: {float(steer)}",float(target_v), float(steer))
-        self.drive_pub_.publish(ack_msg)
-
-        # Visualization
+        # Publish commands
+        cmd = AckermannDriveStamped()
+        cmd.drive.speed = float(target_v)
+        cmd.drive.steering_angle = float(steer)
+        self.drive_pub_.publish(cmd)
+        
+        # Update visualization
         self.visualize_waypoints()
 
-    # --------------------------------------------------------------------------
-    # Helper: bounding box check
-    # --------------------------------------------------------------------------
-    def is_in_bounding_box(self, x, y):
-        return (self.box_x_min <= x <= self.box_x_max) and (self.box_y_min <= y <= self.box_y_max)
-
-    # --------------------------------------------------------------------------
-    # Steering
-    # --------------------------------------------------------------------------
-    def get_steer(self, error):
-        kp = self.get_parameter('kp').get_parameter_value().double_value
-        ki = self.get_parameter('ki').get_parameter_value().double_value
-        kd = self.get_parameter('kd').get_parameter_value().double_value
-        alpha = self.get_parameter('steer_alpha').get_parameter_value().double_value
-        max_control = self.get_parameter('max_control').get_parameter_value().double_value
-
+    def calculate_steering(self, error):
+        """PID steering calculation with smoothing."""
+        params = self.get_parameters(['kp', 'ki', 'kd', 'steer_alpha', 'max_control'])
+        kp, ki, kd, alpha, max_steer = [p.value for p in params]
+        
         d_error = error - self.prev_error
-        self.prev_error = error
         self.integral += error
+        self.prev_error = error
+        
+        raw_steer = kp*error + ki*self.integral + kd*d_error
+        raw_steer = np.clip(raw_steer, -max_steer, max_steer)
+        return alpha*raw_steer + (1-alpha)*self.prev_steer
 
-        raw_steer = kp * error + ki * self.integral + kd * d_error
-        raw_steer = np.clip(raw_steer, -max_control, max_control)
+    def is_in_bounding_box(self, x, y):
+        """Check if current position is within predefined bounding box."""
+        return (self.box_x_min <= x <= self.box_x_max) and \
+               (self.box_y_min <= y <= self.box_y_max)
 
-        new_steer = alpha * raw_steer + (1.0 - alpha) * self.prev_steer
-        self.prev_steer = new_steer
-        return new_steer
-
-    # --------------------------------------------------------------------------
-    # Visualization
-    # --------------------------------------------------------------------------
     def visualize_waypoints(self):
+        """Visualize path and target point in RViz."""
+        # Path visualization
         path_marker = Marker()
         path_marker.header.frame_id = 'map'
-        path_marker.id = 0
-        path_marker.ns = 'pursuit_waypoint_path'
         path_marker.type = Marker.LINE_STRIP
-        path_marker.action = Marker.ADD
-
-        path_marker.points = []
-        path_marker.colors = []
-
-        for i in range(self.x_list.shape[0]):
-            pt = Point()
-            pt.x = float(self.x_list[i])
-            pt.y = float(self.y_list[i])
-            pt.z = 0.0
-            path_marker.points.append(pt)
-
-            speed = self.v_list[i]
-            if (self.v_max - self.v_min) < 1e-9:
-                normalized_s = 0.5
-            else:
-                normalized_s = (speed - self.v_min)/(self.v_max - self.v_min)
-            c = ColorRGBA()
-            c.a = 1.0
-            c.r = 1.0 - normalized_s
-            c.g = normalized_s
-            c.b = 0.0
-            path_marker.colors.append(c)
-
         path_marker.scale.x = 0.05
-        path_marker.scale.y = 0.05
-        path_marker.scale.z = 0.05
-        path_marker.pose.orientation.w = 1.0
+        path_marker.points = [Point(x=float(x), y=float(y)) 
+                            for x, y in zip(self.x_list, self.y_list)]
         self.waypoint_path_pub_.publish(path_marker)
 
-        # Target sphere
+        # Target point visualization
         target_marker = Marker()
         target_marker.header.frame_id = 'map'
-        target_marker.id = 1
-        target_marker.ns = 'pursuit_waypoint_target'
         target_marker.type = Marker.SPHERE
-        target_marker.action = Marker.ADD
-        target_marker.scale.x = 0.3
-        target_marker.scale.y = 0.3
-        target_marker.scale.z = 0.3
-        target_marker.pose.orientation.w = 1.0
+        target_marker.scale.x = target_marker.scale.y = 0.3
         target_marker.pose.position.x = float(self.target_point[0])
         target_marker.pose.position.y = float(self.target_point[1])
-        target_marker.pose.position.z = 0.0
-
-        target_speed = self.v_list[self.curr_target_idx]
-        if (self.v_max - self.v_min) < 1e-9:
-            normalized_s = 0.5
-        else:
-            normalized_s = (target_speed - self.v_min)/(self.v_max - self.v_min)
-
-        target_marker.color.a = 1.0
-        target_marker.color.r = 1.0 - normalized_s
-        target_marker.color.g = normalized_s
-        target_marker.color.b = 0.0
         self.waypoint_pub_.publish(target_marker)
-
 
 def main(args=None):
     rclpy.init(args=args)
-    node = PurePursuit()
-    node.get_logger().info("PurePursuit with obstacle avoidance. Spinning...")
-    rclpy.spin(node)
-    node.destroy_node()
+    controller = PurePursuit()
+    controller.get_logger().info("Pure Pursuit node started")
+    rclpy.spin(controller)
+    controller.destroy_node()
     rclpy.shutdown()
 
 if __name__ == '__main__':
