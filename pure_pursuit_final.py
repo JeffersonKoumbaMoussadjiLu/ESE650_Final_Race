@@ -145,7 +145,7 @@ WHEEL_LENGTH = 0.0381  # (m)
 MAX_STEER = 0.48       # (rad)
 
 # Change this to your CSV with 2 columns [x, y].
-csv_loc = '/home/nvidia/f1tenth_ws/2_column_waypoints.csv'
+csv_loc = '/home/jeff/sim_ws/src/pure_pursuit/scripts/smoothed_final_waypoints.csv'
 
 
 class PurePursuit(Node):
@@ -166,7 +166,7 @@ class PurePursuit(Node):
         self.declare_parameter('kd', 0.005)
         self.declare_parameter("max_control", MAX_STEER)
         self.declare_parameter("steer_alpha", 1.0)
-        self.declare_parameter("distance_threshold", 10.0)
+        self.declare_parameter("distance_threshold", 0.5)
         self.declare_parameter("speed_tolerance", 10.0)
         self.declare_parameter("queue_size", 10)
 
@@ -176,7 +176,7 @@ class PurePursuit(Node):
         self.prev_steer = 0.0
 
         # Flag: set True if using real-world style topics, else sim
-        self.flag = True
+        self.flag = False 
         self.get_logger().info(f"Real-world test? {self.flag}")
 
         # 1) Load CSV waypoints that only have x,y
@@ -341,12 +341,16 @@ class PurePursuit(Node):
             self.mean_cared_ranges < distance_threshold and
             abs(self.filtered_range_rate) < speed_tolerance):
             # Force zero or a smaller speed
-            target_v = 0.0
+            #target_v = 0.0
+            target_v = min(target_v, 4.0)
 
         # Build Ackermann command
         drive_msg = AckermannDriveStamped()
         drive_msg.drive.speed = target_v
         drive_msg.drive.steering_angle = self.get_steer(error)
+
+        print("Speed", target_v)
+        print("Steering Angle", self.get_steer(error))
 
         # Publish the command
         self.drive_pub_.publish(drive_msg)
