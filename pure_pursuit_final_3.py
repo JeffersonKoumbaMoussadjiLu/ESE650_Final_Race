@@ -131,7 +131,7 @@ WIDTH = 0.2032
 WHEEL_LENGTH = 0.0381
 MAX_STEER = 0.48
 
-csv_loc = '/home/jeff/sim_ws/src/pure_pursuit/scripts/smoothed_final_waypoints.csv'
+csv_loc = './smoothed_final_waypoints.csv'
 
 class PurePursuit(Node):
     """
