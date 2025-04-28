@@ -20,7 +20,7 @@ class PurePursuit(Node):
     """
     def __init__(self):
         super().__init__('pure_pursuit_node')
-        self.sim = True
+        self.sim = False
 
         # Subscribe to odometry or pose
         if self.sim:
@@ -39,13 +39,13 @@ class PurePursuit(Node):
 
         # Default Pure Pursuit parameters
         # We'll now treat this as the "default" or fallback L if no zone overrides it
-        self.default_L = 2.0
+        self.default_L = 1.5 #2.0
         self.P = 0.435
-        self.default_speed = 2.0
+        self.default_speed = 3.5
 
         # Load waypoints and build KD-tree
         csv_data = np.loadtxt(
-            "/home/jeff/sim_ws/src/pure_pursuit/scripts/smoothed_final_waypoints.csv",
+            "./final_points.csv",
             delimiter=",",
             skiprows=0
         )
@@ -59,48 +59,48 @@ class PurePursuit(Node):
                 "name": "Box1",
                 "corners": [(-14.31, 8.65), (-5.67, 8.65), (-5.67, 5.03), (-14.31, 5.03)],
                 "speed": 5.0,
-                "lookahead": 2.5
+                "lookahead": 4.0
             },
             {
                 "name": "Box2",
                 "corners": [(-20.84, 8.2), (-14.31, 8.2), (-14.31, 5.03), (-20.84, 5.03)],
-                "speed": 2.5,
-                "lookahead": 1.5
+                "speed": 5.0,
+                "lookahead": 2.0
             },
             {
                 "name": "Box3",
                 "corners": [(-20.65, 4.85), (-17.6, 4.85), (-17.6, 0.75), (-20.65, 0.75)],
-                "speed": 1.8,
-                "lookahead": 1.0
+                "speed": 4.75,
+                "lookahead": 2.0
             },
             {
                 "name": "Box4",
                 "corners": [(-20.84, 0.7), (-16.67, 0.7), (-16.67, -4.3), (-20.84, -4.3)],
-                "speed": 3.0,
-                "lookahead": 1.7
+                "speed": 3.5,
+                "lookahead": 1.0
             },
             {
                 "name": "Box5",
                 "corners": [(-16.35, 5.14), (-4.01, 5.14), (-4.01, -0.56), (-16.35, -0.56)],
-                "speed": 2.3,
-                "lookahead": 1.3
+                "speed": 4.75,
+                "lookahead": 3.0
             },
             {
                 "name": "Box6",
                 "corners": [(-16.35, -0.56), (-6.0, -0.56), (-6.0, -4.23), (-16.35, -4.23)],
-                "speed": 2.0,
-                "lookahead": 1.4
+                "speed": 5.0,
+                "lookahead": 4.0
             },
             {
                 "name": "Box7",
                 "corners": [(-6.0, -0.93), (-1.14, -0.93), (-1.14, -4.23), (-6.0, -4.23)],
-                "speed": 2.5,
-                "lookahead": 1.6
+                "speed": 4.5,
+                "lookahead": 2.0
             },
             {
                 "name": "Box8",
                 "corners": [(-5.67, 8.65), (-1.1, 8.65), (-1.1, -0.93), (-5.67, -0.93)],
-                "speed": 2.5,
+                "speed": 4.5,
                 "lookahead": 1.8
             },
         ]
@@ -233,16 +233,18 @@ class PurePursuit(Node):
                 if valid_ranges.size > 0:
                     min_forward_dist = np.min(valid_ranges)
 
+                    """
                     # Basic logic to slow/stop if something is too close
                     if min_forward_dist < 0.3:
                         speed = 0.0
-                        print("Obstacle < 0.3m => STOP")
+                        #print("Obstacle < 0.3m => STOP")
                     elif min_forward_dist < 1.0:
                         speed = min(speed, 1.0)
-                        print("Obstacle < 1.0m => limit speed to 1.0")
+                        #print("Obstacle < 1.0m => limit speed to 1.0")
                     elif min_forward_dist < 2.0:
                         speed = min(speed, 2.0)
-                        print("Obstacle < 2.0m => limit speed to 2.0")
+                        #print("Obstacle < 2.0m => limit speed to 2.0")
+                    """       
 
         # 7) Publish the drive command
         drive_msg = AckermannDriveStamped()
